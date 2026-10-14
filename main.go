@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,10 +122,10 @@ func parseSince(s string) (time.Duration, error) {
 
 type client struct {
 	base, host, user, token string
-	me                user
-	team              team
-	users             map[string]string // id -> username
-	chans             map[string]string // id -> display label
+	me                      user
+	team                    team
+	users                   map[string]string // id -> username
+	chans                   map[string]string // id -> display label
 }
 
 type user struct {
@@ -169,6 +170,9 @@ type rawBody struct {
 
 var errUnauthorized = errors.New("unauthorized")
 
+// httpc caps every request, uploads included, so a stalled server can't hang the CLI.
+var httpc = &http.Client{Timeout: 60 * time.Second}
+
 // tokenPath is the session token cache, one file per server and user.
 func (c *client) tokenPath() string {
 	home, _ := os.UserHomeDir()
@@ -197,7 +201,7 @@ func (c *client) login() error {
 		return fmt.Errorf("no Keychain password for service=%s account=%s", c.host, c.user)
 	}
 	body, _ := json.Marshal(map[string]string{"login_id": c.user, "password": strings.TrimRight(string(pw), "\n")})
-	resp, err := http.Post(c.base+"/api/v4/users/login", "application/json", bytes.NewReader(body))
+	resp, err := httpc.Post(c.base+"/api/v4/users/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -262,7 +266,7 @@ func (c *client) once(method, path, ct string, payload []byte, out any) error {
 	if payload != nil {
 		req.Header.Set("Content-Type", ct)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpc.Do(req)
 	if err != nil {
 		return err
 	}
@@ -342,18 +346,24 @@ func (c *client) loadUsers(ids []string) {
 func (c *client) label(ch channel) string {
 	switch ch.Type {
 	case "D":
-		other := c.me.ID // a DM with yourself is "me__me"
-		for _, id := range strings.Split(ch.Name, "__") {
-			if id != c.me.ID {
-				other = id
-			}
-		}
+		other := c.dmOther(ch)
 		c.loadUsers([]string{other})
 		return "@" + c.users[other]
 	case "G":
 		return ch.DisplayName
 	}
 	return "~" + ch.Name
+}
+
+// dmOther is the other user of a DM channel named "<id>__<id>"; a DM with yourself is "me__me".
+func (c *client) dmOther(ch channel) string {
+	other := c.me.ID
+	for _, id := range strings.Split(ch.Name, "__") {
+		if id != c.me.ID {
+			other = id
+		}
+	}
+	return other
 }
 
 func (c *client) channelLabel(id string) string {
@@ -456,6 +466,18 @@ func sorted(pl postList) []post {
 	return posts
 }
 
+// inOrder returns the posts listed in pl.Order, oldest-first. A channel page's
+// Posts map also holds the thread roots of replies on the page, which Order leaves out.
+func inOrder(pl postList) []post {
+	posts := make([]post, 0, len(pl.Order))
+	for i := len(pl.Order) - 1; i >= 0; i-- {
+		if p, ok := pl.Posts[pl.Order[i]]; ok {
+			posts = append(posts, p)
+		}
+	}
+	return posts
+}
+
 // ---- commands ----
 
 func run(args []string) error {
@@ -537,6 +559,13 @@ func (c *client) channels(o opts) error {
 	if err := c.call("GET", "/users/me/teams/"+c.team.ID+"/channels/members", nil, &members); err != nil {
 		return err
 	}
+	var dms []string
+	for _, ch := range chans {
+		if ch.Type == "D" {
+			dms = append(dms, c.dmOther(ch))
+		}
+	}
+	c.loadUsers(dms) // one batch, so label doesn't look DM users up one by one
 	seen := map[string][2]int64{}
 	for _, m := range members {
 		seen[m.ChannelID] = [2]int64{m.MsgCount, m.MentionCount}
@@ -582,7 +611,7 @@ func (c *client) read(o opts) error {
 	if err := c.call("GET", fmt.Sprintf("/channels/%s/posts?per_page=%d", id, perPage), nil, &pl); err != nil {
 		return err
 	}
-	posts := sorted(pl)
+	posts := inOrder(pl)
 	if o.since > 0 {
 		cutoff := time.Now().Add(-o.since).UnixMilli()
 		posts = posts[sort.Search(len(posts), func(i int) bool { return posts[i].CreateAt >= cutoff }):]
@@ -678,9 +707,12 @@ func (c *client) search(terms, mention string, o opts) error {
 // newest keeps the last n posts (oldest-first input), optionally only those mentioning @mention.
 func newest(posts []post, mention string, n int) []post {
 	if mention != "" {
+		// "@alice" may end in . - _ (trailing punctuation) but not continue as a
+		// longer username such as @alicebob or @alice.bob.
+		re := regexp.MustCompile(`(?i)@` + regexp.QuoteMeta(mention) + `[._-]*(?:$|[^a-z0-9._-])`)
 		kept := posts[:0]
 		for _, p := range posts {
-			if strings.Contains(strings.ToLower(p.Message), "@"+strings.ToLower(mention)) {
+			if re.MatchString(p.Message) {
 				kept = append(kept, p)
 			}
 		}

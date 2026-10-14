@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -31,6 +34,74 @@ func TestNewest(t *testing.T) {
 	}
 	if got := newest(append([]post(nil), posts...), "", 2); len(got) != 2 || got[0].ID != "3" || got[1].ID != "4" {
 		t.Fatalf("limit keeps newest: %+v", got)
+	}
+}
+
+func TestMentionMatch(t *testing.T) {
+	for msg, want := range map[string]bool{
+		"@alice": true, "hi @alice.": true, "@alice, ping": true, "@alice-": true, "@ALICE:": true, "@alice\nmore": true,
+		"@alicebob": false, "@alice.bob": false, "@alice_bob": false, "@alice-bob": false, "alice": false,
+	} {
+		if got := len(newest([]post{{Message: msg}}, "alice", 5)) == 1; got != want {
+			t.Errorf("%q: got %v, want %v", msg, got, want)
+		}
+	}
+	// QuoteMeta: the dot in "a.b" is literal
+	if len(newest([]post{{Message: "@axb"}}, "a.b", 5)) != 0 || len(newest([]post{{Message: "@a.b"}}, "a.b", 5)) != 1 {
+		t.Error("username with a dot")
+	}
+}
+
+func TestInOrder(t *testing.T) {
+	// Order is newest-first and leaves out the old thread root "r" that Posts carries.
+	pl := postList{
+		Order: []string{"c", "b", "a", "gone"},
+		Posts: map[string]post{"r": {ID: "r", CreateAt: 1}, "a": {ID: "a", CreateAt: 5}, "b": {ID: "b", CreateAt: 5}, "c": {ID: "c", CreateAt: 9}},
+	}
+	got := inOrder(pl)
+	if len(got) != 3 || got[0].ID != "a" || got[1].ID != "b" || got[2].ID != "c" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestChannelsBatchesDMUsers(t *testing.T) {
+	lookups := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/users/me/teams/t1/channels":
+			_ = json.NewEncoder(w).Encode([]channel{
+				{ID: "d1", Name: "me__u1", Type: "D"}, {ID: "d2", Name: "u2__me", Type: "D"},
+				{ID: "d3", Name: "me__me", Type: "D"}, {ID: "o1", Name: "town-square", Type: "O"},
+			})
+		case "/api/v4/users/me/teams/t1/channels/members":
+			_, _ = w.Write([]byte("[]"))
+		case "/api/v4/users/ids":
+			lookups++
+			var ids []string
+			_ = json.NewDecoder(r.Body).Decode(&ids)
+			us := []user{}
+			for _, id := range ids {
+				us = append(us, user{ID: id, Username: "name-" + id})
+			}
+			_ = json.NewEncoder(w).Encode(us)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := &client{base: srv.URL, token: "x", me: user{ID: "me", Username: "me"}, team: team{ID: "t1"},
+		users: map[string]string{"me": "me"}, chans: map[string]string{}}
+
+	if err := c.channels(opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 1 {
+		t.Fatalf("user lookups = %d, want 1", lookups)
+	}
+	for name, want := range map[string]string{"me__u1": "@name-u1", "u2__me": "@name-u2", "me__me": "@me"} {
+		if got := c.label(channel{Name: name, Type: "D"}); got != want {
+			t.Errorf("%s: got %s, want %s", name, got, want)
+		}
 	}
 }
 
